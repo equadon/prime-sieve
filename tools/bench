@@ -1,0 +1,344 @@
+#!/usr/bin/env python
+from __future__ import print_function
+
+import argparse
+import glob
+import logging
+import os
+import re
+import subprocess
+
+from math import log
+from os import path
+from textwrap import dedent
+from mako.template import Template
+
+from gnuplot import GNUPlot
+
+
+DIR = path.abspath(path.join(path.dirname(path.abspath(__file__)), '..'))
+BIN_DIR = path.join(DIR, 'bin')
+BUILD_DIR = path.join(DIR, 'build')
+STATS_DIR = path.join(BUILD_DIR, 'stats')
+RES_DIR = path.join(DIR, 'res')
+TEMPLATE_DIR = path.join(RES_DIR, 'templates')
+TOOLS_DIR = path.join(DIR, 'tools')
+
+
+RE_STATS = re.compile(dedent(r'''
+    Name: (?P<name>.*)
+    Program: (?P<program>.*)
+    Type: (?P<type>.*)
+    Cores: (?P<cores>\d+)
+    T: (?P<T>\d+)
+    Test #: (?P<test>\d+)
+    Elapsed time: (?P<elapsed>[\d\.]+) second\(s\)
+    Prime count: (?P<primes>\d+)\n.*
+    \tUser time \(seconds\): (?P<usrtime>[\d\.]+)
+    \tSystem time \(seconds\): (?P<systime>[\d\.]+)
+    .*
+    \tMaximum resident set size \(kbytes\): (?P<memory>\d+)
+'''), re.DOTALL)
+
+
+def generate_html(filename, strong_tests, weak_tests, gprof_txt, gprof_T):
+    with open(path.join(RES_DIR, 'bootstrap.min.css'), 'r') as f:
+        bootstrap_css = f.read()
+
+    # get GProf HTML output
+    gprof = subprocess.check_output(('python', 'tools/gprof2html/gprof2html.py', '--partial', gprof_txt))
+
+    data = (
+        ('Strong', strong_tests.stats),
+        ('Weak', weak_tests.stats),
+    )
+
+    params = dict(
+        bootstrap_css=bootstrap_css,
+        numtests=strong_tests.args.N,
+        plot_time_strong_svg=strong_tests.time_plot.render_svg(),
+        plot_speedup_strong_svg=strong_tests.speedup_plot.render_svg(),
+        plot_memory_strong_svg=strong_tests.memory_plot.render_svg(),
+        plot_time_weak_svg=weak_tests.time_plot.render_svg(),
+        plot_speedup_weak_svg=weak_tests.speedup_plot.render_svg(),
+        plot_memory_weak_svg=weak_tests.memory_plot.render_svg(),
+        tests=data,
+        gprof_tabs=gprof,
+        gprof_T=gprof_T,
+    )
+
+    template = Template(filename=path.join(TEMPLATE_DIR, 'index.html.mako'))
+
+    with open(filename, 'w+') as f:
+        f.write(template.render(**params))
+
+
+def calc_mean(tests, key, stats):
+    data = [x[1][key] for x in tests]
+    if len(data) > 2:
+        mintest = min(data)
+        maxtest = max(data)
+
+        # mark min/max as "removed"
+        if stats is not None:
+            stats[tests[data.index(mintest)][2]][-1] = True
+            stats[tests[data.index(maxtest)][2]][-1] = True
+
+        data.remove(mintest)
+        data.remove(maxtest)
+    return sum(data) / float(len(data))
+
+
+def get_test_data(text):
+    m = RE_STATS.search(text)
+    result = m.groupdict()
+
+    result['cores'] = int(result['cores'])
+    result['T'] = int(result['T'])
+    result['test'] = int(result['test'])
+    result['primes'] = int(result['primes'])
+    result['elapsed'] = float(result['elapsed'])
+    result['time'] = float(result['usrtime']) + float(result['systime'])
+    result['memory'] = float(result['memory']) / 1000.0
+
+    del result['usrtime']
+    del result['systime']
+
+    return result
+
+
+class ScalabilityTests:
+    def __init__(self, name, T, args):
+        self.name = name
+        self.T = T
+        self.args = args
+        self.log = logging.getLogger('%s-tests' % name)
+        self.tests = {}
+        self.test_num = 1
+        self.total_tests = len(args.types) * len(args.cores) * args.N
+        self.time_plot = None
+        self.speedup_plot = None
+        self.memory_plot = None
+        self.stats = []
+
+    def run(self):
+        self.log.info('Running %s scalability tests.' % self.name)
+        params = zip(self.args.cores, self.T)
+        for _type in self.args.types:
+            for param in params:
+                cores, T = param
+                filename = '%(name)s_%(type)s_%(cores)d_%(T)d_%%d.stat' % dict(
+                    name=self.name,
+                    type=_type,
+                    cores=cores,
+                    T=T,
+                )
+
+                filepath = path.relpath(path.join(STATS_DIR, filename))
+                self._run_test(cores, T, _type, filepath)
+
+    def _run_test(self, cores, T, _type, filepath):
+        self.log.info('Running tests for: {name=%s, type=%s, cores=%d, T=%d}' % (self.name, _type, cores, T))
+
+        if _type not in self.tests:
+            self.tests[_type] = dict()
+        if (cores, T) not in self.tests[_type]:
+            self.tests[_type][(cores, T)] = []
+
+        for n in range(1, self.args.N+1):
+            cmd = '/usr/bin/time -v %s %s %d %d' % (self.args.program, _type, cores, T)
+            self.log.info('[%2d/%2d]  time test #%d: %s' % (self.test_num, self.total_tests, n, cmd))
+            self.test_num += 1
+
+            output = subprocess.check_output(
+                cmd,
+                stderr=subprocess.STDOUT,
+                shell=True
+            )
+
+            pre_output = dedent('''
+                Name: %s
+                Program: %s
+                Type: %s
+                Cores: %d
+                T: %d
+                Test #: %d\n''' % (self.name, self.args.program, _type, cores, T, n))
+
+            with open(filepath % n, 'w+') as f:
+                f.write(pre_output)
+                f.write(output)
+
+            data = get_test_data('%s%s' % (pre_output, output))
+
+            if cores > 1:
+                prev = None
+                for key in self.tests[data['type']].keys():
+                    if key[0] == 1:
+                        prev = self.tests[data['type']][key]
+                speedup = prev[data['test']-1][1]['elapsed'] / data['elapsed']
+            else:
+                speedup = None
+
+            self.tests[_type][(cores, T)].append((filepath, data, len(self.stats)))
+            self.stats.append([n, _type, cores, T, data['primes'], data['elapsed'], data['time'], speedup, data['memory'], False])
+
+    def load(self, files):
+        self.log.info('Loading %d %s scalability tests.' % (len(files), self.name))
+        for filename in files:
+            with open(filename, 'r') as f:
+                data = get_test_data(f.read())
+                if data['type'] not in self.tests:
+                    self.tests[data['type']] = dict()
+                if (data['cores'], data['T']) not in self.tests[data['type']]:
+                    self.tests[data['type']][(data['cores'], data['T'])] = []
+                self.tests[data['type']][(data['cores'], data['T'])].append((filename, data, len(self.stats)))
+
+                if data['cores'] > 1:
+                    prev = None
+                    for key in self.tests[data['type']].keys():
+                        if key[0] == 1:
+                            prev = self.tests[data['type']][key]
+                    speedup = prev[data['test']-1][1]['elapsed'] / data['elapsed']
+                else:
+                    speedup = None
+                self.stats.append([data['test'], data['type'], data['cores'], data['T'], data['primes'], data['elapsed'], data['time'], speedup, data['memory'], False])
+
+    def generate_plots(self):
+        plot_dir = makedirs(path.join(BUILD_DIR, 'gnuplot'))
+
+        self.time_plot = GNUPlot(path.join(plot_dir, 'plot_time_%s' % self.name), TEMPLATE_DIR)
+        self.speedup_plot = GNUPlot(path.join(plot_dir, 'plot_speedup_%s' % self.name), TEMPLATE_DIR)
+        self.memory_plot = GNUPlot(path.join(plot_dir, 'plot_memory_%s' % self.name), TEMPLATE_DIR)
+
+        for _type, params in self.tests.items():
+            seq_time = None
+            for (cores, T), tests in sorted(params.items()):
+                time = calc_mean(tests, 'elapsed', self.stats)  # TODO: use elapsed or usr+sys time?
+                if cores == 1:
+                    seq_time = time
+                speedup = seq_time / time
+                memory = calc_mean(tests, 'memory', None)
+
+                self.time_plot.add_data(_type, cores, time)
+                self.speedup_plot.add_data(_type, cores, speedup)
+                self.memory_plot.add_data(_type, cores, memory)  # megabytes
+
+        if len(set(self.T)) > 1:
+            label = r'T =\n   %s' % (r'\n   '.join('{:,}'.format(x).replace(',', ' ') for x in self.T))
+        else:
+            label = 'T = %s' % '{:,}'.format(self.T[0]).replace(',', ' ')
+
+        title = self.name.title()
+
+        self.time_plot.save(title, 'Time', 'Cores', 'Time (seconds)', label)
+        self.speedup_plot.save(title, 'Speedup', 'Cores', 'Speedup', label)
+        self.memory_plot.save(title, 'Memory', 'Cores', 'Memory (MB)', label)
+
+        return self.time_plot, self.speedup_plot, self.memory_plot
+
+
+def makedirs(path):
+    try:
+        os.makedirs(path)
+    except OSError:
+        pass
+    return path
+
+
+def setup():
+    # logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='[%(asctime)s] %(levelname)-7s (%(name)s) %(message)s',
+        filename=path.join(DIR, 'bench.log'),
+        filemode='w',
+        datefmt='%H:%M:%S',
+    )
+
+    formatter = logging.Formatter(
+        fmt='[%(asctime)s] %(levelname)-8s %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+    logging.getLogger('').addHandler(console)
+
+    # command line arguments
+    parser = argparse.ArgumentParser(description='Benchmarking tool for parallel prime sieve in IOOPM.')
+    parser.add_argument('program', help='prime sieve binary')
+    parser.add_argument('cores', type=int, help='number of cores to use')
+    parser.add_argument('T', type=int, help='count primes up to T')
+    parser.add_argument('N', type=int, help='number of runs per test')
+    parser.add_argument('gprof_txt', metavar='gprov.txt', help='gprof text output')
+    parser.add_argument('--stats-dir', '-s', metavar='DIR', help='use existing stats from directory')
+
+    # create directories
+    makedirs(STATS_DIR)
+
+    args = parser.parse_args()
+
+    args.types = ['bit', 'bool']
+    args.cores = [2**i for i in range(1 + int(log(args.cores) / log(2)))]
+    args.Tstrong = [args.T for _ in range(len(args.cores))]
+    args.Tweak = [c * (args.T / 2**(len(args.cores)-1)) for c in args.cores]
+
+    if args.stats_dir is None:
+        args.collect_stats = True
+        args.stats_dir = STATS_DIR
+    else:
+        args.collect_stats = False
+        args.stats_dir = path.abspath(args.stats_dir)
+
+    return args, logging.getLogger('bench')
+
+
+def log_params(args):
+    params = dict(
+        program=args.program,
+        types=args.types,
+        cores=args.cores,
+        N=args.N,
+        Tstrong=args.Tstrong,
+        Tweak=args.Tweak,
+        stats_dir=args.stats_dir
+    )
+
+    log.info(dedent('''    Parameters:
+        Program:                 %(program)s
+        Array types:             %(types)s
+        Cores:                   %(cores)s
+        T (strong scalability):  %(Tstrong)s
+        T (weak scalability):    %(Tweak)s
+        Number of tests:         %(N)d
+        Stats directory:         %(stats_dir)s''' % params))
+
+
+if __name__ == '__main__':
+    args, log = setup()
+
+    log.info('Benchmark tool started.')
+
+    log_params(args)
+
+    strong_tests = ScalabilityTests('strong', args.Tstrong, args)
+    weak_tests = ScalabilityTests('weak', args.Tweak, args)
+
+    if args.collect_stats:
+        strong_tests.run()
+        weak_tests.run()
+    else:
+        strong_files = glob.glob(path.join(args.stats_dir, 'strong_*.stat'))
+        strong_tests.load(strong_files)
+
+        weak_files = glob.glob(path.join(args.stats_dir, 'weak_*.stat'))
+        weak_tests.load(weak_files)
+
+    # generate GNU plots
+    strong_time_plot, strong_speedup_plot, strong_memory_plot = strong_tests.generate_plots()
+    weak_time_plot, weak_speedup_plot, weak_memory_plot = weak_tests.generate_plots()
+
+    # generate HTML
+    generate_html(path.join(BUILD_DIR, 'index.html'), strong_tests, weak_tests, args.gprof_txt, args.T)
+
+    log.info('Benchmark tool finished.')
